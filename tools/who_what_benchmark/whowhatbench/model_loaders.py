@@ -43,6 +43,10 @@ disable_progress_bar()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+if Version(__version__) >= Version("4.56"):
+    PYTORCH_MODEL_DTYPE_KWARG = {"dtype": torch.float32}
+else:
+    PYTORCH_MODEL_DTYPE_KWARG = {"torch_dtype": torch.float32}
 
 def _sanitize_load_kwargs(model_type, use_hf, use_genai, use_llamacpp, kwargs):
     sanitized_kwargs = dict(kwargs)
@@ -273,7 +277,9 @@ def load_omni_hf_pipeline(model_id, device, config, trust_remote_code=False, **k
 
 
 def load_text_hf_pipeline(model_id, device, **kwargs):
+
     model_kwargs = {}
+
     trust_remote_code = False
     config = None
     if kwargs.get('gguf_file'):
@@ -291,6 +297,7 @@ def load_text_hf_pipeline(model_id, device, **kwargs):
         if not kwargs.get("gguf_file") and config and getattr(config, "quantization_config", None):
             is_gptq = config.quantization_config["quant_method"] == "gptq"
             is_awq = config.quantization_config["quant_method"] == "awq"
+
         with mock_AwqQuantizer_validate_environment(is_awq), mock_torch_cuda_is_available(is_gptq or is_awq):
             model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=trust_remote_code, device_map="cpu", **model_kwargs)
         if is_awq:
@@ -307,6 +314,12 @@ def load_text_hf_pipeline(model_id, device, **kwargs):
 
     if kwargs.get("adapters") is not None:
         model = apply_peft_adapters(model, kwargs["adapters"], kwargs.get("alphas", None))
+
+    if is_cpu and getattr(getattr(model, "config", None), "model_type", None) == "gpt_oss":
+        logger.info("Casting GPT-OSS HF model to float32 on CPU to avoid MoE dtype mismatches")
+        model = model.float()
+        if getattr(model, "config", None) is not None:
+            model.config.torch_dtype = torch.float32
 
     model.eval()
     return model
@@ -1102,7 +1115,7 @@ def load_model(
 
     sanitized_kwargs = _sanitize_load_kwargs(model_type, use_hf, use_genai, use_llamacpp, kwargs)
 
-    if model_type == "text" or model_type == "text-chat":
+    if model_type in ("text", "text-agent", "text-chat"):
         return load_text_model(model_id, device, ov_options, use_hf, use_genai, use_llamacpp, **sanitized_kwargs)
     elif model_type == "text-to-image":
         return load_text2image_model(model_id, device, ov_options, use_hf, use_genai, **sanitized_kwargs)
