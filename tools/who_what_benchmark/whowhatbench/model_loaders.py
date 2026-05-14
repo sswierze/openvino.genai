@@ -70,6 +70,7 @@ class GenAIModelWrapper:
 
     def __init__(self, model, model_dir, model_type):
         self.model = model
+        self.model_dir = model_dir
         self.model_type = model_type
 
         if model_type in (
@@ -197,14 +198,19 @@ def load_text_hf_pipeline(model_id, device, **kwargs):
     config = None
     if kwargs.get('gguf_file'):
         model_kwargs['gguf_file'] = kwargs['gguf_file']
+    else:
+        try:
+            config = AutoConfig.from_pretrained(model_id)
+        except Exception:
+            config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+            trust_remote_code = True
+        # MoE weights of gpt_oss models post-trained with MXFP4 quantization
+        # they are dequantized with torch.bfloat16 https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/integrations/mxfp4.py#L104
+        # forcing the model to any other type will cause a type mismatch error
+        # https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L117
+        if getattr(config, "model_type", None) == "gpt_oss":
+            model_kwargs["torch_dtype"] = "auto"
     if is_cpu:
-        if not kwargs.get('gguf_file'):
-            try:
-                config = AutoConfig.from_pretrained(model_id)
-            except Exception:
-                config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-                trust_remote_code = True
-
         is_gptq = False
         is_awq = False
         if not kwargs.get('gguf_file'):

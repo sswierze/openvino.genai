@@ -9,6 +9,7 @@ import os
 
 import pandas as pd
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 from .registry import BaseEvaluator, register_evaluator
 from .utils import get_ignore_parameters_flag, patch_awq_for_inference
@@ -34,7 +35,6 @@ class TextAgentEvaluator(BaseEvaluator):
         num_assistant_tokens: int = 0,
         assistant_confidence_threshold: float = 0.0,
         is_genai_backend: bool = False,
-        omit_chat_template: bool = False,
     ) -> None:
         assert (
             base_model is not None or gt_data is not None
@@ -50,12 +50,11 @@ class TextAgentEvaluator(BaseEvaluator):
         self.num_assistant_tokens = num_assistant_tokens
         self.assistant_confidence_threshold = assistant_confidence_threshold
         self.is_genai_backend = is_genai_backend
-        self.omit_chat_template = omit_chat_template
         self.gt_dir = os.path.dirname(gt_data or "")
         self.target_dir = None
 
         if base_model:
-            result_dir = os.path.join(self.gt_dir, "reference") if self.gt_dir else None
+            result_dir = os.path.join(self.gt_dir, "reference")
             self.gt_data = self._generate_data(base_model, gen_answer_fn, result_dir=result_dir)
         else:
             self.gt_data = pd.read_csv(gt_data, keep_default_na=False)
@@ -73,51 +72,19 @@ class TextAgentEvaluator(BaseEvaluator):
     def get_generation_fn(self):
         return self.generation_fn
 
-    @staticmethod
-    def _resolve_existing_file(path_value: Any, fallback_dirs: List[str]) -> Optional[str]:
-        if not isinstance(path_value, str):
-            return None
-
-        if os.path.exists(path_value):
-            return path_value
-
-        file_name = os.path.basename(path_value.replace("\\", "/"))
-        if not file_name:
-            return None
-
-        for directory in fallback_dirs:
-            if not directory:
-                continue
-            candidate = os.path.join(directory, file_name)
-            if os.path.exists(candidate):
-                return candidate
-
-        return None
-
     def _read_text_data(self, data: pd.DataFrame) -> pd.DataFrame:
         text_data = {"answers": [], "prompts": []}
 
-        fallback_prompt_dirs = [
-            os.path.join(self.gt_dir, "reference", "prompts") if self.gt_dir else None,
-            os.path.join(self.target_dir, "prompts") if self.target_dir else None,
-        ]
-        fallback_answer_dirs = [
-            os.path.join(self.gt_dir, "reference") if self.gt_dir else None,
-            self.target_dir,
-        ]
-
         for path_or_prompt in data["prompts"].values:
-            resolved_prompt_path = self._resolve_existing_file(path_or_prompt, fallback_prompt_dirs)
-            if resolved_prompt_path:
-                with open(resolved_prompt_path, "r", encoding="utf-8") as f:
+            if isinstance(path_or_prompt, str) and os.path.exists(path_or_prompt):
+                with open(path_or_prompt, "r", encoding="utf-8") as f:
                     text_data["prompts"].append(f.read())
             else:
                 text_data["prompts"].append(path_or_prompt)
 
         for path_or_answer in data["answers"].values:
-            resolved_answer_path = self._resolve_existing_file(path_or_answer, fallback_answer_dirs)
-            if resolved_answer_path:
-                with open(resolved_answer_path, "r", encoding="utf-8") as f:
+            if isinstance(path_or_answer, str) and os.path.exists(path_or_answer):
+                with open(path_or_answer, "r", encoding="utf-8") as f:
                     answer = json.load(f)
                     text_data["answers"].append(answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False))
             else:
@@ -148,7 +115,9 @@ class TextAgentEvaluator(BaseEvaluator):
 
     def score(self, model_or_data, gen_answer_fn=None, **kwargs):
         output_dir = kwargs.get("output_dir")
-        result_folder = os.path.join(output_dir, "target") if output_dir else None
+        result_folder = os.path.join(output_dir, "target") if output_dir else (
+            os.path.join(self.gt_dir, "target") if self.gt_dir else "target"
+        )
         self.target_dir = result_folder
 
         if isinstance(model_or_data, str) and os.path.exists(model_or_data):
@@ -252,7 +221,11 @@ class TextAgentEvaluator(BaseEvaluator):
         if isinstance(content, str):
             return bool(content.strip())
         if isinstance(content, list):
-            return len(content) > 0
+            return any(
+                (isinstance(item, dict) and item.get("text", "").strip())
+                or (isinstance(item, str) and item.strip())
+                for item in content
+            )
         return content is not None
 
     @staticmethod
@@ -275,7 +248,7 @@ class TextAgentEvaluator(BaseEvaluator):
 
         config = getattr(model, "config", None)
         model_type = getattr(config, "model_type", None)
-        if model_type in chat_template_map:
+        if model_type and model_type in chat_template_map:
             template_source = chat_template_map[model_type]
             logger.info(
                 "Matched model_type '%s' with chat template source: %s",
@@ -284,18 +257,11 @@ class TextAgentEvaluator(BaseEvaluator):
             )
             return template_source
 
-        candidate_names = []
-        for value in (
-            getattr(config, "_name_or_path", None),
-            getattr(tokenizer, "name_or_path", None),
-            getattr(model, "model_dir", None),
-        ):
-            if value:
-                candidate_names.append(str(value).lower())
-
-        for candidate_name in candidate_names:
+        model_dir = getattr(model, "model_dir", None)
+        if model_dir:
+            model_dir_lower = str(model_dir).lower()
             for key, template_source in chat_template_map.items():
-                if key in candidate_name:
+                if key in model_dir_lower:
                     logger.info(
                         "Matched model '%s' with chat template source: %s",
                         key,
@@ -316,7 +282,10 @@ class TextAgentEvaluator(BaseEvaluator):
                 response.raise_for_status()
                 return response.text
 
-            from transformers import AutoTokenizer
+            try:
+                tokenizer_chat_template = tokenizer.get_chat_template()
+            except Exception:
+                tokenizer_chat_template = getattr(tokenizer, "chat_template", None)
 
             logger.info("Loading chat template from model: %s", chat_template_source)
             custom_tokenizer = AutoTokenizer.from_pretrained(chat_template_source, trust_remote_code=True)
@@ -365,26 +334,19 @@ class TextAgentEvaluator(BaseEvaluator):
             logger.error("Template render failed. Tools: %s", json.dumps(tools, ensure_ascii=False, default=str) if tools else None)
             raise
 
-    def _apply_thinking_controls_for_template(self, kwargs: Dict[str, Any], chat_template: Optional[str]) -> None:
-        if self.omit_chat_template or not isinstance(chat_template, str):
-            return
-        if "enable_thinking" in chat_template:
-            kwargs["enable_thinking"] = False
-        if "reasoning_effort" in chat_template:
-            kwargs["reasoning_effort"] = "low"
-
-    def _generate_non_genai(self, model, tokenizer, record: Dict[str, Any]) -> str:
+    def _generate_non_genai(self, model, tokenizer, record: Dict[str, Any], chat_template: Optional[str] = None) -> str:
         messages = record["messages"]
 
         tools = record.get("tools")
         device = getattr(model, "device", "cpu")
-        chat_template = self._load_chat_template(model, tokenizer)
-        if chat_template is not None and not self.omit_chat_template:
+        if chat_template is None:
+            chat_template = self._load_chat_template(model, tokenizer)
+        if chat_template is not None:
             prompt = self._render_messages_to_prompt(messages, tools, chat_template)
             if not isinstance(prompt, str) or not prompt.strip():
                 raise ValueError(
                     "Rendered prompt is empty after chat template application; "
-                    "use --omit-chat-template or fix the template/messages"
+                    "check/fix the template or messages"
                 )
             inputs = tokenizer(prompt, return_tensors="pt").to(device)
         else:
@@ -396,15 +358,6 @@ class TextAgentEvaluator(BaseEvaluator):
             }
             if tools is not None:
                 chat_kwargs["tools"] = tools
-            tokenizer_chat_template = None
-            if hasattr(tokenizer, "get_chat_template"):
-                try:
-                    tokenizer_chat_template = tokenizer.get_chat_template()
-                except Exception:
-                    tokenizer_chat_template = getattr(tokenizer, "chat_template", None)
-            else:
-                tokenizer_chat_template = getattr(tokenizer, "chat_template", None)
-            self._apply_thinking_controls_for_template(chat_kwargs, tokenizer_chat_template)
             inputs = tokenizer.apply_chat_template(messages, **chat_kwargs).to(device)
 
         if "input_ids" not in inputs or inputs["input_ids"].shape[-1] == 0:
@@ -437,7 +390,7 @@ class TextAgentEvaluator(BaseEvaluator):
         answer_tokens = tokens[:, inputs["input_ids"].shape[-1]:]
         return tokenizer.batch_decode(answer_tokens, skip_special_tokens=True)[0]
 
-    def _generate_genai(self, model, _tokenizer, record: Dict[str, Any]) -> str:
+    def _generate_genai(self, model, _tokenizer, record: Dict[str, Any], chat_template: Optional[str] = None) -> str:
         import openvino_genai
 
         messages = record["messages"]
@@ -474,14 +427,15 @@ class TextAgentEvaluator(BaseEvaluator):
             kwargs["adapters"] = openvino_genai.AdapterConfig()
 
         tools = record.get("tools")
-        chat_template = self._load_chat_template(model, _tokenizer)
+        if chat_template is None:
+            chat_template = self._load_chat_template(model, _tokenizer)
 
-        if chat_template is not None and not self.omit_chat_template:
+        if chat_template is not None:
             prompt = self._render_messages_to_prompt(messages, tools, chat_template)
             if not isinstance(prompt, str) or not prompt.strip():
                 raise ValueError(
                     "Rendered prompt is empty after chat template application; "
-                    "use --omit-chat-template or fix the template/messages"
+                    "check/fix the template or messages"
                 )
 
             # Prompt is already rendered with Jinja2 template; do not re-apply template in GenAI.
@@ -496,9 +450,14 @@ class TextAgentEvaluator(BaseEvaluator):
             return res.texts[0]
         return str(res)
 
-    def _generate_data(self, model, gen_answer_fn=None, result_dir=None):
+    def _generate_data(self, model, gen_answer_fn=None, result_dir=None, output_dir=None):
         if gen_answer_fn is None:
             gen_answer_fn = self._generate_genai if self.is_genai_backend else self._generate_non_genai
+
+        if result_dir is None:
+            result_dir = os.path.join(self.gt_dir, "target") if self.gt_dir else "target"
+
+        chat_template = self._load_chat_template(model, self.tokenizer)
 
         records = self._get_records()
         prompts = []
@@ -512,11 +471,17 @@ class TextAgentEvaluator(BaseEvaluator):
                     "check the messages content in your dataset"
                 )
             prompts.append(prompt_preview)
-            answers.append(gen_answer_fn(model, self.tokenizer, record))
+            # Pass chat_template if the generation function accepts it
+            try:
+                answers.append(gen_answer_fn(model, self.tokenizer, record, chat_template=chat_template))
+            except TypeError:
+                # Fallback for custom gen_answer_fn that don't accept chat_template parameter
+                answers.append(gen_answer_fn(model, self.tokenizer, record))
 
-        prompts_result = prompts
-        answers_result = answers
+        # For long prompts/answers prefer path-based storage in CSV.
         if result_dir:
-            prompts_result, answers_result = self._save_prompts_and_answers(prompts_result, answers_result, result_dir)
+            prompt_paths, answer_paths = self._save_prompts_and_answers(prompts, answers, result_dir)
+            return pd.DataFrame({"prompts": prompt_paths, "answers": answer_paths})
 
-        return pd.DataFrame({"prompts": prompts_result, "answers": answers_result})
+        # Backward-compatible fallback when no result directory is provided.
+        return pd.DataFrame({"prompts": prompts, "answers": answers})
