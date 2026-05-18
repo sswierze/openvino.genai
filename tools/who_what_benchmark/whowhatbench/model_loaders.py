@@ -42,7 +42,10 @@ disable_progress_bar()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-PYTORCH_MODEL_DTYPE_KWARG = {"torch_dtype": torch.float32}
+if Version(__version__) >= Version("4.56"):
+    PYTORCH_MODEL_DTYPE_KWARG = {"dtype": torch.float32}
+else:
+    PYTORCH_MODEL_DTYPE_KWARG = {"torch_dtype": torch.float32}
 
 
 def _create_genai_adapter_config(adapters=None, alphas=None, *, none_if_empty=False):
@@ -67,6 +70,7 @@ class GenAIModelWrapper:
 
     def __init__(self, model, model_dir, model_type):
         self.model = model
+        self.model_dir = model_dir
         self.model_type = model_type
 
         if model_type in (
@@ -189,7 +193,9 @@ def load_text_llamacpp_pipeline(model_dir):
 
 def load_text_hf_pipeline(model_id, device, **kwargs):
     model_kwargs = {**PYTORCH_MODEL_DTYPE_KWARG}
+    is_cpu = not torch.cuda.is_available or device.lower() == "cpu"
     trust_remote_code = False
+    config = None
     if kwargs.get('gguf_file'):
         model_kwargs['gguf_file'] = kwargs['gguf_file']
     else:
@@ -204,12 +210,10 @@ def load_text_hf_pipeline(model_id, device, **kwargs):
         # https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L117
         if getattr(config, "model_type", None) == "gpt_oss":
             model_kwargs["torch_dtype"] = "auto"
-
-    if not torch.cuda.is_available or device.lower() == "cpu":
+    if is_cpu:
         is_gptq = False
         is_awq = False
         if not kwargs.get('gguf_file'):
-
             if getattr(config, "quantization_config", None):
                 is_gptq = config.quantization_config["quant_method"] == "gptq"
                 is_awq = config.quantization_config["quant_method"] == "awq"
@@ -885,7 +889,7 @@ def load_model(
     else:
         ov_options = {}
 
-    if model_type == "text" or model_type == "text-chat":
+    if model_type == "text" or model_type == "text-chat" or model_type == "text-agent":
         return load_text_model(model_id, device, ov_options, use_hf, use_genai, use_llamacpp, **kwargs)
     elif model_type == "text-to-image":
         return load_text2image_model(
