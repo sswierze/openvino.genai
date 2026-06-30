@@ -753,7 +753,6 @@ def create_evaluator(base_model, args):
                 test_data=prompts,
                 tokenizer=tokenizer,
                 similarity_model_id=args.data_encoder,
-                max_new_tokens=args.max_new_tokens,
                 num_samples=args.num_samples,
                 language=args.language,
                 gen_answer_fn=gen_answer_fn,
