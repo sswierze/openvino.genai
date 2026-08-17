@@ -409,5 +409,3 @@ def read_json_dataset(dataset_path: str):
 
     logger.info(f"Loaded {len(items)} records from JSON dataset")
     return items
-
-
